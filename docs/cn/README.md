@@ -1,7 +1,7 @@
 <div align="center">
 
-<h1>GPT-SoVITS-WebUI</h1>
-强大的少样本语音转换与语音合成Web用户界面.<br><br>
+<h1>GPT-SoVITS-MultiWeight</h1>
+基于 NVIDIA MPS 的单卡多权重 GPT-SoVITS 推理工程.<br><br>
 
 [![madewithlove](https://img.shields.io/badge/made_with-%E2%9D%A4-red?style=for-the-badge&labelColor=orange)](https://github.com/RVC-Boss/GPT-SoVITS)
 
@@ -26,6 +26,61 @@
 
 ---
 
+## 本 Fork 定位
+
+这个 fork 的重点不是通用 WebUI 部署，而是：
+
+> 在单张 NVIDIA GPU 上，不依赖 vGPU，基于多进程固定权重 + NVIDIA MPS，实现多权重并发推理。
+
+当前项目重点如下：
+
+- 单卡部署，多固定权重 worker 并发推理。
+- 不需要 vGPU。
+- 使用 NVIDIA MPS 做进程级算力份额控制，不宣称整卡硬隔离。
+- 共享前处理与后处理公共组件，减少重复加载。
+- 主模型推理保持 worker 级隔离。
+
+### 哪些组件会复用
+
+以下模块适合做共享服务或只读复用：
+
+- 文本清洗与切分
+- g2pw
+- tokenizer / BERT
+- CNHuBERT
+- 参考音频只读预处理与只读缓存
+- 按版本共享的 vocoder
+- SR 模型
+
+### 哪些组件会独立成 MPS worker
+
+以下部分保持在固定权重 worker 内独立运行，不共享可变推理态：
+
+- GPT / T2S 主模型
+- SoVITS / VITS 主模型
+- `prompt_cache`
+- 参考音频上下文缓存
+- 请求模式切换状态
+- 任何推理过程中会被修改的模型内部状态
+
+### 当前已验证能力
+
+- 在 24GB 显存卡上，当前方案可稳定运行 8 个固定权重 worker。
+- 在 24GB / 8 worker 配置下，并发推理时各 worker 延迟基本一致，没有明显拉开。
+- 在 RTX 4090 上，目标能力为 `RTF < 1`，可用于实时流式生成。
+
+### 当前支持范围
+
+- 目前仅支持 Linux + CUDA。
+- 需要 NVIDIA GPU。
+- 需要计算能力 `SM >= 3.5`。
+- 基本上现在仍在使用的 NVIDIA 显卡都满足这个要求。
+
+更多架构边界、复用拆分和实施步骤可参考：
+
+- [ARCHITECTURE.md](../../ARCHITECTURE.md)
+- [IMPLEMENTATION_PLAN.md](../../IMPLEMENTATION_PLAN.md)
+
 ## 功能
 
 1. **零样本文本到语音 (TTS):** 输入 5 秒的声音样本, 即刻体验文本到语音转换.
@@ -45,6 +100,12 @@
 **用户手册: [简体中文](https://www.yuque.com/baicaigongchang1145haoyuangong/ib3g1e) | [English](https://rentry.co/GPT-SoVITS-guide#/)**
 
 ## 安装
+
+> 说明
+>
+> 本文档仍保留了较多上游 GPT-SoVITS 的安装与 WebUI 内容。
+> 对本 fork 而言，当前维护和验证的主路径是 Linux + CUDA + NVIDIA GPU。
+> 下方的 Windows、macOS、非 CUDA 路径更适合作为上游参考，而不是本 fork 当前的主要支持范围。
 
 中国地区的用户可[点击此处](https://www.codewithgpu.com/i/RVC-Boss/GPT-SoVITS/GPT-SoVITS-Official)使用 AutoDL 云端镜像进行体验.
 
@@ -181,239 +242,6 @@ bash docker_build.sh --cuda <12.6|12.8> [--lite]
 ```bash
 docker exec -it <GPT-SoVITS-CU126-Lite|GPT-SoVITS-CU128-Lite|GPT-SoVITS-CU126|GPT-SoVITS-CU128> bash
 ```
-
-## 预训练模型
-
-**若成功运行`install.sh`可跳过 No.1,2,3**
-
-**中国地区的用户可以[在此处下载这些模型](https://www.yuque.com/baicaigongchang1145haoyuangong/ib3g1e/dkxgpiy9zb96hob4#nVNhX).**
-
-1. 从 [GPT-SoVITS Models](https://huggingface.co/lj1995/GPT-SoVITS) 下载预训练模型, 并将其放置在 `GPT_SoVITS/pretrained_models` 目录中.
-
-2. 从 [G2PWModel.zip(HF)](https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/G2PWModel.zip)| [G2PWModel.zip(ModelScope)](https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/G2PWModel.zip) 下载模型, 解压并重命名为 `G2PWModel`, 然后将其放置在 `GPT_SoVITS/text` 目录中. (仅限中文 TTS)
-
-3. 对于 UVR5 (人声/伴奏分离和混响移除, 额外功能), 从 [UVR5 Weights](https://huggingface.co/lj1995/VoiceConversionWebUI/tree/main/uvr5_weights) 下载模型, 并将其放置在 `tools/uvr5/uvr5_weights` 目录中.
-
-   - 如果你在 UVR5 中使用 `bs_roformer` 或 `mel_band_roformer`模型, 你可以手动下载模型和相应的配置文件, 并将它们放在 `tools/UVR5/UVR5_weights` 中.**重命名模型文件和配置文件, 确保除后缀外**, 模型和配置文件具有相同且对应的名称.此外, 模型和配置文件名**必须包含"roformer"**, 才能被识别为 roformer 类的模型.
-
-   - 建议在模型名称和配置文件名中**直接指定模型类型**, 例如`mel_mand_roformer`、`bs_roformer`.如果未指定, 将从配置文中比对特征, 以确定它是哪种类型的模型.例如, 模型`bs_roformer_ep_368_sdr_12.9628.ckpt` 和对应的配置文件`bs_roformer_ep_368_sdr_12.9628.yaml` 是一对.`kim_mel_band_roformer.ckpt` 和 `kim_mel_band_roformer.yaml` 也是一对.
-
-4. 对于中文 ASR (额外功能), 从 [Damo ASR Model](https://modelscope.cn/models/damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch/files)、[Damo VAD Model](https://modelscope.cn/models/damo/speech_fsmn_vad_zh-cn-16k-common-pytorch/files) 和 [Damo Punc Model](https://modelscope.cn/models/damo/punc_ct-transformer_zh-cn-common-vocab272727-pytorch/files) 下载模型, 并将它们放置在 `tools/asr/models` 目录中.
-
-5. 对于英语或日语 ASR (额外功能), 从 [Faster Whisper Large V3](https://huggingface.co/Systran/faster-whisper-large-v3) 下载模型, 并将其放置在 `tools/asr/models` 目录中.此外, [其他模型](https://huggingface.co/Systran) 可能具有类似效果且占用更少的磁盘空间.
-
-## 数据集格式
-
-文本到语音 (TTS) 注释 .list 文件格式:
-
-```
-vocal_path|speaker_name|language|text
-```
-
-语言字典:
-
-- 'zh': 中文
-- 'ja': 日语
-- 'en': 英语
-- 'ko': 韩语
-- 'yue': 粤语
-
-示例:
-
-```
-D:\GPT-SoVITS\xxx/xxx.wav|xxx|zh|我爱玩原神.
-```
-
-## 微调与推理
-
-### 打开 WebUI
-
-#### 整合包用户
-
-双击`go-webui.bat`或者使用`go-webui.ps1`
-若想使用 V1,则双击`go-webui-v1.bat`或者使用`go-webui-v1.ps1`
-
-#### 其他
-
-```bash
-python webui.py <language(optional)>
-```
-
-若想使用 V1,则
-
-```bash
-python webui.py v1 <language(optional)>
-```
-
-或者在 webUI 内动态切换
-
-### 微调
-
-#### 现已支持自动填充路径
-
-1. 填入训练音频路径
-2. 切割音频
-3. 进行降噪(可选)
-4. 进行 ASR
-5. 校对标注
-6. 前往下一个窗口,点击训练
-
-### 打开推理 WebUI
-
-#### 整合包用户
-
-双击 `go-webui.bat` 或者使用 `go-webui.ps1` ,然后在 `1-GPT-SoVITS-TTS/1C-推理` 中打开推理 webUI
-
-#### 其他
-
-```bash
-python GPT_SoVITS/inference_webui.py <language(optional)>
-```
-
-或者
-
-```bash
-python webui.py
-```
-
-然后在 `1-GPT-SoVITS-TTS/1C-推理` 中打开推理 webUI
-
-## V2 发布说明
-
-新特性:
-
-1. 支持韩语及粤语
-
-2. 更好的文本前端
-
-3. 底模由 2k 小时扩展至 5k 小时
-
-4. 对低音质参考音频 (尤其是来源于网络的高频严重缺失、听着很闷的音频) 合成出来音质更好
-
-   详见[wiki](<https://github.com/RVC-Boss/GPT-SoVITS/wiki/GPT%E2%80%90SoVITS%E2%80%90v2%E2%80%90features-(%E6%96%B0%E7%89%B9%E6%80%A7)>)
-
-从 v1 环境迁移至 v2
-
-1. 需要 pip 安装 requirements.txt 更新环境
-
-2. 需要克隆 github 上的最新代码
-
-3. 需要从[huggingface](https://huggingface.co/lj1995/GPT-SoVITS/tree/main/gsv-v2final-pretrained) 下载预训练模型文件放到 GPT_SoVITS/pretrained_models/gsv-v2final-pretrained 下
-
-   中文额外需要下载[G2PWModel.zip(HF)](https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/G2PWModel.zip)| [G2PWModel.zip(ModelScope)](https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/G2PWModel.zip) (下载 G2PW 模型,解压并重命名为`G2PWModel`,将其放到`GPT_SoVITS/text`目录下)
-
-## V3 更新说明
-
-新模型特点:
-
-1. 音色相似度更像, 需要更少训练集来逼近本人 (不训练直接使用底模模式下音色相似性提升更大)
-
-2. GPT 合成更稳定, 重复漏字更少, 也更容易跑出丰富情感
-
-   详见[wiki](<https://github.com/RVC-Boss/GPT-SoVITS/wiki/GPT%E2%80%90SoVITS%E2%80%90v2%E2%80%90features-(%E6%96%B0%E7%89%B9%E6%80%A7)>)
-
-从 v2 环境迁移至 v3
-
-1. 需要 pip 安装 requirements.txt 更新环境
-
-2. 需要克隆 github 上的最新代码
-
-3. 从[huggingface](https://huggingface.co/lj1995/GPT-SoVITS/tree/main)下载这些 v3 新增预训练模型 (s1v3.ckpt, s2Gv3.pth and models--nvidia--bigvgan_v2_24khz_100band_256x folder)将他们放到`GPT_SoVITS/pretrained_models`目录下
-
-   如果想用音频超分功能缓解 v3 模型生成 24k 音频觉得闷的问题, 需要下载额外的模型参数, 参考[how to download](../../tools/AP_BWE_main/24kto48k/readme.txt)
-
-## V4 更新说明
-
-新特性：
-
-1. **V4 版本修复了 V3 版本中由于非整数倍上采样导致的金属音问题, 并原生输出 48kHz 音频以避免声音闷糊 (而 V3 版本仅原生输出 24kHz 音频)**. 作者认为 V4 是对 V3 的直接替代, 但仍需进一步测试.
-   [更多详情](<https://github.com/RVC-Boss/GPT-SoVITS/wiki/GPT%E2%80%90SoVITS%E2%80%90v3v4%E2%80%90features-(%E6%96%B0%E7%89%B9%E6%80%A7)>)
-
-从 V1/V2/V3 环境迁移至 V4：
-
-1. 执行 `pip install -r requirements.txt` 更新部分依赖包.
-
-2. 从 GitHub 克隆最新代码.
-
-3. 从 [huggingface](https://huggingface.co/lj1995/GPT-SoVITS/tree/main) 下载 V4 预训练模型 (`gsv-v4-pretrained/s2v4.ckpt` 和 `gsv-v4-pretrained/vocoder.pth`), 并放入 `GPT_SoVITS/pretrained_models` 目录.
-
-## V2Pro 更新说明
-
-新特性：
-
-1. **相比 V2 占用稍高显存, 性能超过 V4, 在保留 V2 硬件成本和推理速度优势的同时实现更高音质.**
-   [更多详情](<https://github.com/RVC-Boss/GPT-SoVITS/wiki/GPT%E2%80%90SoVITS%E2%80%90features-(%E5%90%84%E7%89%88%E6%9C%AC%E7%89%B9%E6%80%A7)>)
-
-2. V1/V2 与 V2Pro 系列具有相同特性, V3/V4 则具备相近功能. 对于平均音频质量较低的训练集, V1/V2/V2Pro 可以取得较好的效果, 但 V3/V4 无法做到. 此外, V3/V4 合成的声音更偏向参考音频, 而不是整体训练集的风格.
-
-从 V1/V2/V3/V4 环境迁移至 V2Pro：
-
-1. 执行 `pip install -r requirements.txt` 更新部分依赖包.
-
-2. 从 GitHub 克隆最新代码.
-
-3. 从 [huggingface](https://huggingface.co/lj1995/GPT-SoVITS/tree/main) 下载 V2Pro 预训练模型 (`v2Pro/s2Dv2Pro.pth`, `v2Pro/s2Gv2Pro.pth`, `v2Pro/s2Dv2ProPlus.pth`, `v2Pro/s2Gv2ProPlus.pth`, 和 `sv/pretrained_eres2netv2w24s4ep4.ckpt`), 并放入 `GPT_SoVITS/pretrained_models` 目录.
-
-## 待办事项清单
-
-- [x] **高优先级:**
-
-  - [x] 日语和英语的本地化.
-  - [x] 用户指南.
-  - [x] 日语和英语数据集微调训练.
-
-- [ ] **功能:**
-  - [x] 零样本声音转换 (5 秒) / 少样本声音转换 (1 分钟).
-  - [x] TTS 语速控制.
-  - [ ] ~~增强的 TTS 情感控制.~~
-  - [ ] 尝试将 SoVITS 令牌输入更改为词汇的概率分布.
-  - [x] 改进英语和日语文本前端.
-  - [ ] 开发体积小和更大的 TTS 模型.
-  - [x] Colab 脚本.
-  - [x] 扩展训练数据集 (从 2k 小时到 10k 小时).
-  - [x] 更好的 sovits 基础模型 (增强的音频质量).
-  - [ ] 模型混合.
-
-## (附加) 命令行运行方式
-
-使用命令行打开 UVR5 的 WebUI
-
-```bash
-python tools/uvr5/webui.py "<infer_device>" <is_half> <webui_port_uvr5>
-```
-
-<!-- 如果打不开浏览器, 请按照下面的格式进行UVR处理, 这是使用mdxnet进行音频处理的方式
-````
-python mdxnet.py --model --input_root --output_vocal --output_ins --agg_level --format --device --is_half_precision
-```` -->
-
-这是使用命令行完成数据集的音频切分的方式
-
-```bash
-python audio_slicer.py \
-    --input_path "<path_to_original_audio_file_or_directory>" \
-    --output_root "<directory_where_subdivided_audio_clips_will_be_saved>" \
-    --threshold <volume_threshold> \
-    --min_length <minimum_duration_of_each_subclip> \
-    --min_interval <shortest_time_gap_between_adjacent_subclips>
-    --hop_size <step_size_for_computing_volume_curve>
-```
-
-这是使用命令行完成数据集 ASR 处理的方式 (仅限中文)
-
-```bash
-python tools/asr/funasr_asr.py -i <input> -o <output>
-```
-
-通过 Faster_Whisper 进行 ASR 处理 (除中文之外的 ASR 标记)
-
-(没有进度条, GPU 性能可能会导致时间延迟)
-
-```bash
-python ./tools/asr/fasterwhisper_asr.py -i <input> -o <output> -l <language> -p <precision>
-```
-
-启用自定义列表保存路径
 
 ## 致谢
 

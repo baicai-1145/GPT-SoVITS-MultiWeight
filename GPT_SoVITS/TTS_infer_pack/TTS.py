@@ -34,6 +34,8 @@ from tools.audio_sr import AP_BWE
 from tools.i18n.i18n import I18nAuto, scan_language_list
 from TTS_infer_pack.text_segmentation_method import splits
 from TTS_infer_pack.TextPreprocessor import TextPreprocessor
+from services.preprocess.local_adapter import LocalPreprocessAdapter
+from services.postprocess.local_adapter import LocalPostprocessAdapter
 from sv import SV
 
 resample_transform_dict = {}
@@ -419,7 +421,13 @@ class TTS_Config:
 
 
 class TTS:
-    def __init__(self, configs: Union[dict, str, TTS_Config]):
+    def __init__(
+        self,
+        configs: Union[dict, str, TTS_Config],
+        main_weights_locked: bool = False,
+        preprocess_adapter=None,
+        postprocess_adapter=None,
+    ):
         if isinstance(configs, TTS_Config):
             self.configs = configs
         else:
@@ -442,12 +450,11 @@ class TTS:
             "upsample_rate": None,
             "overlapped_len": None,
         }
+        self.main_weights_locked: bool = False
 
+        self._init_preprocess_adapter(preprocess_adapter)
+        self._init_postprocess_adapter(postprocess_adapter)
         self._init_models()
-
-        self.text_preprocessor: TextPreprocessor = TextPreprocessor(
-            self.bert_model, self.bert_tokenizer, self.configs.device
-        )
 
         self.prompt_cache: dict = {
             "ref_audio_path": None,
@@ -459,38 +466,142 @@ class TTS:
             "bert_features": None,
             "norm_text": None,
             "aux_ref_audio_paths": [],
+            "raw_audio": None,
+            "raw_sr": None,
         }
 
         self.stop_flag: bool = False
         self.precision: torch.dtype = torch.float16 if self.configs.is_half else torch.float32
+        if main_weights_locked:
+            self.lock_main_weights()
 
     def _init_models(
         self,
     ):
         self.init_t2s_weights(self.configs.t2s_weights_path)
         self.init_vits_weights(self.configs.vits_weights_path)
-        self.init_bert_weights(self.configs.bert_base_path)
-        self.init_cnhuhbert_weights(self.configs.cnhuhbert_base_path)
         # self.enable_half_precision(self.configs.is_half)
 
+    def _init_preprocess_adapter(self, preprocess_adapter=None):
+        if preprocess_adapter is None:
+            preprocess_adapter = LocalPreprocessAdapter(
+                bert_base_path=self.configs.bert_base_path,
+                cnhuhbert_base_path=self.configs.cnhuhbert_base_path,
+                device=self.configs.device,
+                is_half=self.configs.is_half,
+            )
+        self.preprocess_adapter = preprocess_adapter
+        self._sync_preprocess_aliases()
+
+    def _init_postprocess_adapter(self, postprocess_adapter=None):
+        if postprocess_adapter is None:
+            postprocess_adapter = LocalPostprocessAdapter(
+                device=self.configs.device,
+                is_half=self.configs.is_half,
+            )
+        self.postprocess_adapter = postprocess_adapter
+
+    def _sync_vocoder_config(self, version: str):
+        if hasattr(self.postprocess_adapter, "get_vocoder_config"):
+            self.vocoder_configs = self.postprocess_adapter.get_vocoder_config(version)
+
+    def _sync_preprocess_aliases(self):
+        self.bert_tokenizer = getattr(self.preprocess_adapter, "bert_tokenizer", None)
+        self.bert_model = getattr(self.preprocess_adapter, "bert_model", None)
+        self.cnhuhbert_model = getattr(self.preprocess_adapter, "cnhuhbert_model", None)
+        self.text_preprocessor = getattr(self.preprocess_adapter, "text_preprocessor", None)
+
+    def lock_main_weights(self):
+        self.main_weights_locked = True
+
+    def _ensure_main_weight_mutation_allowed(self, weight_type: str, target_path: str, current_path: str):
+        if not self.main_weights_locked:
+            return
+        if current_path in [None, ""] or target_path in [None, ""]:
+            return
+        if os.path.abspath(target_path) == os.path.abspath(current_path):
+            return
+        raise RuntimeError(f"{weight_type} weights are locked for this worker")
+
+    def get_health_status(self) -> dict:
+        try:
+            preprocess_health = (
+                self.preprocess_adapter.get_health_status() if hasattr(self.preprocess_adapter, "get_health_status") else {}
+            )
+        except Exception as exc:
+            preprocess_health = {"ready": False, "error": str(exc)}
+        try:
+            postprocess_health = (
+                self.postprocess_adapter.get_health_status() if hasattr(self.postprocess_adapter, "get_health_status") else {}
+            )
+        except Exception as exc:
+            postprocess_health = {"ready": False, "error": str(exc)}
+        preprocess_ready = preprocess_health.get("ready", self.preprocess_adapter is not None)
+        postprocess_ready = postprocess_health.get("ready", self.postprocess_adapter is not None)
+        return {
+            "ready": all(
+                model is not None
+                for model in [
+                    self.t2s_model,
+                    self.vits_model,
+                ]
+            )
+            and preprocess_ready
+            and postprocess_ready,
+            "device": str(self.configs.device),
+            "version": self.configs.version,
+            "main_weights_locked": self.main_weights_locked,
+            "preprocess": preprocess_health,
+            "postprocess": postprocess_health,
+        }
+
+    def get_runtime_meta(self) -> dict:
+        try:
+            preprocess_meta = (
+                self.preprocess_adapter.get_runtime_meta() if hasattr(self.preprocess_adapter, "get_runtime_meta") else {}
+            )
+        except Exception as exc:
+            preprocess_meta = {"error": str(exc)}
+        try:
+            postprocess_meta = (
+                self.postprocess_adapter.get_runtime_meta() if hasattr(self.postprocess_adapter, "get_runtime_meta") else {}
+            )
+        except Exception as exc:
+            postprocess_meta = {"error": str(exc)}
+        return {
+            "device": str(self.configs.device),
+            "is_half": self.configs.is_half,
+            "version": self.configs.version,
+            "t2s_weights_path": self.configs.t2s_weights_path,
+            "vits_weights_path": self.configs.vits_weights_path,
+            "bert_base_path": self.configs.bert_base_path,
+            "cnhuhbert_base_path": self.configs.cnhuhbert_base_path,
+            "main_weights_locked": self.main_weights_locked,
+            "use_vocoder": self.configs.use_vocoder,
+            "vocoder_loaded": bool(postprocess_meta.get("loaded_vocoders")),
+            "sr_model_loaded": bool(postprocess_meta.get("sr_model_loaded", False)),
+            "preprocess": preprocess_meta,
+            "postprocess": postprocess_meta,
+        }
+
     def init_cnhuhbert_weights(self, base_path: str):
-        print(f"Loading CNHuBERT weights from {base_path}")
-        self.cnhuhbert_model = CNHubert(base_path)
-        self.cnhuhbert_model = self.cnhuhbert_model.eval()
-        self.cnhuhbert_model = self.cnhuhbert_model.to(self.configs.device)
-        if self.configs.is_half and str(self.configs.device) != "cpu":
-            self.cnhuhbert_model = self.cnhuhbert_model.half()
+        self.configs.cnhuhbert_base_path = base_path
+        if not hasattr(self.preprocess_adapter, "init_cnhuhbert_weights"):
+            raise RuntimeError("Current preprocess adapter does not support CNHuBERT reload")
+        self.preprocess_adapter.init_cnhuhbert_weights(base_path)
+        self._sync_preprocess_aliases()
+        self.configs.save_configs()
 
     def init_bert_weights(self, base_path: str):
-        print(f"Loading BERT weights from {base_path}")
-        self.bert_tokenizer = AutoTokenizer.from_pretrained(base_path)
-        self.bert_model = AutoModelForMaskedLM.from_pretrained(base_path)
-        self.bert_model = self.bert_model.eval()
-        self.bert_model = self.bert_model.to(self.configs.device)
-        if self.configs.is_half and str(self.configs.device) != "cpu":
-            self.bert_model = self.bert_model.half()
+        self.configs.bert_base_path = base_path
+        if not hasattr(self.preprocess_adapter, "init_bert_weights"):
+            raise RuntimeError("Current preprocess adapter does not support BERT reload")
+        self.preprocess_adapter.init_bert_weights(base_path)
+        self._sync_preprocess_aliases()
+        self.configs.save_configs()
 
     def init_vits_weights(self, weights_path: str):
+        self._ensure_main_weight_mutation_allowed("SoVITS", weights_path, self.configs.vits_weights_path)
         self.configs.vits_weights_path = weights_path
         version, model_version, if_lora_v3 = get_sovits_version_from_path_fast(weights_path)
         if "Pro" in model_version:
@@ -543,6 +654,13 @@ class TTS:
                 **kwargs,
             )
             self.configs.use_vocoder = False
+            self.vocoder_configs = {
+                "sr": None,
+                "T_ref": None,
+                "T_chunk": None,
+                "upsample_rate": None,
+                "overlapped_len": None,
+            }
         else:
             kwargs["version"] = model_version
             vits_model = SynthesizerTrnV3(
@@ -592,6 +710,7 @@ class TTS:
 
 
     def init_t2s_weights(self, weights_path: str):
+        self._ensure_main_weight_mutation_allowed("GPT", weights_path, self.configs.t2s_weights_path)
         print(f"Loading Text2Semantic weights from {weights_path}")
         self.configs.t2s_weights_path = weights_path
         self.configs.save_configs()
@@ -613,75 +732,17 @@ class TTS:
         self.configs.mute_emb_sim_matrix = sim_matrix
 
     def init_vocoder(self, version: str):
-        if version == "v3":
-            if self.vocoder is not None and self.vocoder.__class__.__name__ == "BigVGAN":
-                return
-            if self.vocoder is not None:
-                self.vocoder.cpu()
-                del self.vocoder
-                self.empty_cache()
-
-            self.vocoder = BigVGAN.from_pretrained(
-                "%s/GPT_SoVITS/pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x" % (now_dir,),
-                use_cuda_kernel=False,
-            )  # if True, RuntimeError: Ninja is required to load C++ extensions
-            # remove weight norm in the model and set to eval mode
-            self.vocoder.remove_weight_norm()
-
-            self.vocoder_configs["sr"] = 24000
-            self.vocoder_configs["T_ref"] = 468
-            self.vocoder_configs["T_chunk"] = 934
-            self.vocoder_configs["upsample_rate"] = 256
-            self.vocoder_configs["overlapped_len"] = 12
-
-        elif version == "v4":
-            if self.vocoder is not None and self.vocoder.__class__.__name__ == "Generator":
-                return
-            if self.vocoder is not None:
-                self.vocoder.cpu()
-                del self.vocoder
-                self.empty_cache()
-
-            self.vocoder = Generator(
-                initial_channel=100,
-                resblock="1",
-                resblock_kernel_sizes=[3, 7, 11],
-                resblock_dilation_sizes=[[1, 3, 5], [1, 3, 5], [1, 3, 5]],
-                upsample_rates=[10, 6, 2, 2, 2],
-                upsample_initial_channel=512,
-                upsample_kernel_sizes=[20, 12, 4, 4, 4],
-                gin_channels=0,
-                is_bias=True,
-            )
-            self.vocoder.remove_weight_norm()
-            state_dict_g = torch.load(
-                "%s/GPT_SoVITS/pretrained_models/gsv-v4-pretrained/vocoder.pth" % (now_dir,),
-                map_location="cpu",
-                weights_only=False,
-            )
-            print("loading vocoder", self.vocoder.load_state_dict(state_dict_g))
-
-            self.vocoder_configs["sr"] = 48000
-            self.vocoder_configs["T_ref"] = 500
-            self.vocoder_configs["T_chunk"] = 1000
-            self.vocoder_configs["upsample_rate"] = 480
-            self.vocoder_configs["overlapped_len"] = 12
-
-        self.vocoder = self.vocoder.eval()
-        if self.configs.is_half == True:
-            self.vocoder = self.vocoder.half().to(self.configs.device)
-        else:
-            self.vocoder = self.vocoder.to(self.configs.device)
+        self._sync_vocoder_config(version)
+        if hasattr(self.postprocess_adapter, "warmup_vocoder"):
+            self.postprocess_adapter.warmup_vocoder(version)
 
     def init_sr_model(self):
-        if self.sr_model is not None:
-            return
-        try:
-            self.sr_model: AP_BWE = AP_BWE(self.configs.device, DictToAttrRecursive)
-            self.sr_model_not_exist = False
-        except FileNotFoundError:
-            print(i18n("你没有下载超分模型的参数，因此不进行超分。如想超分请先参照教程把文件下载好"))
-            self.sr_model_not_exist = True
+        if hasattr(self.postprocess_adapter, "init_sr_model"):
+            model = self.postprocess_adapter.init_sr_model()
+            self.sr_model = model
+            self.sr_model_not_exist = model is None
+            if self.sr_model_not_exist:
+                print(i18n("你没有下载超分模型的参数，因此不进行超分。如想超分请先参照教程把文件下载好"))
 
     def init_sv_model(self):
         if self.sv_model is not None:
@@ -708,23 +769,16 @@ class TTS:
                 self.t2s_model = self.t2s_model.half()
             if self.vits_model is not None:
                 self.vits_model = self.vits_model.half()
-            if self.bert_model is not None:
-                self.bert_model = self.bert_model.half()
-            if self.cnhuhbert_model is not None:
-                self.cnhuhbert_model = self.cnhuhbert_model.half()
-            if self.vocoder is not None:
-                self.vocoder = self.vocoder.half()
         else:
             if self.t2s_model is not None:
                 self.t2s_model = self.t2s_model.float()
             if self.vits_model is not None:
                 self.vits_model = self.vits_model.float()
-            if self.bert_model is not None:
-                self.bert_model = self.bert_model.float()
-            if self.cnhuhbert_model is not None:
-                self.cnhuhbert_model = self.cnhuhbert_model.float()
-            if self.vocoder is not None:
-                self.vocoder = self.vocoder.float()
+        if hasattr(self.preprocess_adapter, "enable_half_precision"):
+            self.preprocess_adapter.enable_half_precision(enable)
+            self._sync_preprocess_aliases()
+        if hasattr(self.postprocess_adapter, "enable_half_precision"):
+            self.postprocess_adapter.enable_half_precision(enable)
 
     def set_device(self, device: torch.device, save: bool = True):
         """
@@ -739,14 +793,32 @@ class TTS:
             self.t2s_model = self.t2s_model.to(device)
         if self.vits_model is not None:
             self.vits_model = self.vits_model.to(device)
-        if self.bert_model is not None:
-            self.bert_model = self.bert_model.to(device)
-        if self.cnhuhbert_model is not None:
-            self.cnhuhbert_model = self.cnhuhbert_model.to(device)
-        if self.vocoder is not None:
-            self.vocoder = self.vocoder.to(device)
-        if self.sr_model is not None:
-            self.sr_model = self.sr_model.to(device)
+        if hasattr(self.preprocess_adapter, "set_device"):
+            self.preprocess_adapter.set_device(device)
+            self._sync_preprocess_aliases()
+        if hasattr(self.postprocess_adapter, "set_device"):
+            self.postprocess_adapter.set_device(device)
+
+    def _preprocess_reference_audio(self, ref_audio_path: str) -> dict:
+        return self.preprocess_adapter.preprocess_reference_audio(
+            ref_audio_path=ref_audio_path,
+            sampling_rate=self.configs.sampling_rate,
+            filter_length=self.configs.filter_length,
+            hop_length=self.configs.hop_length,
+            win_length=self.configs.win_length,
+            is_half=self.configs.is_half,
+            need_v2_audio=self.is_v2pro,
+        )
+
+    def _apply_reference_features(self, ref_audio_path: str, ref_audio_features: dict):
+        self.prompt_cache["raw_audio"] = ref_audio_features["raw_audio"]
+        self.prompt_cache["raw_sr"] = ref_audio_features["raw_sr"]
+        self._set_ref_audio_path(ref_audio_path)
+        self._set_prompt_semantic(ref_audio_path, ref_audio_features)
+        if self.prompt_cache["refer_spec"] in [[], None]:
+            self.prompt_cache["refer_spec"] = [(ref_audio_features["spec"], ref_audio_features["audio_16k"])]
+        else:
+            self.prompt_cache["refer_spec"][0] = (ref_audio_features["spec"], ref_audio_features["audio_16k"])
 
     def set_ref_audio(self, ref_audio_path: str):
         """
@@ -755,9 +827,8 @@ class TTS:
         Args:
             ref_audio_path: str, the path of the reference audio.
         """
-        self._set_prompt_semantic(ref_audio_path)
-        self._set_ref_spec(ref_audio_path)
-        self._set_ref_audio_path(ref_audio_path)
+        ref_audio_features = self._preprocess_reference_audio(ref_audio_path)
+        self._apply_reference_features(ref_audio_path, ref_audio_features)
 
     def _set_ref_audio_path(self, ref_audio_path):
         self.prompt_cache["ref_audio_path"] = ref_audio_path
@@ -770,65 +841,17 @@ class TTS:
             self.prompt_cache["refer_spec"][0] = spec_audio
 
     def _get_ref_spec(self, ref_audio_path):
-        raw_audio, raw_sr = torchaudio.load(ref_audio_path)
-        raw_audio = raw_audio.to(self.configs.device).float()
-        self.prompt_cache["raw_audio"] = raw_audio
-        self.prompt_cache["raw_sr"] = raw_sr
+        ref_audio_features = self._preprocess_reference_audio(ref_audio_path)
+        self.prompt_cache["raw_audio"] = ref_audio_features["raw_audio"]
+        self.prompt_cache["raw_sr"] = ref_audio_features["raw_sr"]
+        return ref_audio_features["spec"], ref_audio_features["audio_16k"]
 
-        if raw_sr != self.configs.sampling_rate:
-            audio = raw_audio.to(self.configs.device)
-            if audio.shape[0] == 2:
-                audio = audio.mean(0).unsqueeze(0)
-            audio = resample(audio, raw_sr, self.configs.sampling_rate, self.configs.device)
-        else:
-            audio = raw_audio.to(self.configs.device)
-            if audio.shape[0] == 2:
-                audio = audio.mean(0).unsqueeze(0)
-
-        maxx = audio.abs().max()
-        if maxx > 1:
-            audio /= min(2, maxx)
-        spec = spectrogram_torch(
-            audio,
-            self.configs.filter_length,
-            self.configs.sampling_rate,
-            self.configs.hop_length,
-            self.configs.win_length,
-            center=False,
-        )
-        if self.configs.is_half:
-            spec = spec.half()
-        if self.is_v2pro == True:
-            audio = resample(audio, self.configs.sampling_rate, 16000, self.configs.device)
-            if self.configs.is_half:
-                audio = audio.half()
-        else:
-            audio = None
-        return spec, audio
-
-    def _set_prompt_semantic(self, ref_wav_path: str):
-        zero_wav = np.zeros(
-            int(self.configs.sampling_rate * 0.3),
-            dtype=np.float16 if self.configs.is_half else np.float32,
-        )
+    def _set_prompt_semantic(self, ref_wav_path: str, ref_audio_features: dict = None):
+        if ref_audio_features is None:
+            ref_audio_features = self._preprocess_reference_audio(ref_wav_path)
         with torch.no_grad():
-            wav16k, sr = librosa.load(ref_wav_path, sr=16000)
-            if wav16k.shape[0] > 160000 or wav16k.shape[0] < 48000:
-                raise OSError(i18n("参考音频在3~10秒范围外，请更换！"))
-            wav16k = torch.from_numpy(wav16k)
-            zero_wav_torch = torch.from_numpy(zero_wav)
-            wav16k = wav16k.to(self.configs.device)
-            zero_wav_torch = zero_wav_torch.to(self.configs.device)
-            if self.configs.is_half:
-                wav16k = wav16k.half()
-                zero_wav_torch = zero_wav_torch.half()
-
-            wav16k = torch.cat([wav16k, zero_wav_torch])
-            hubert_feature = self.cnhuhbert_model.model(wav16k.unsqueeze(0))["last_hidden_state"].transpose(
-                1, 2
-            )  # .float()
+            hubert_feature = ref_audio_features["hubert_feature"].to(self.configs.device)
             codes = self.vits_model.extract_latent(hubert_feature)
-
             prompt_semantic = codes[0, 0].to(self.configs.device)
             self.prompt_cache["prompt_semantic"] = prompt_semantic
 
@@ -1156,20 +1179,23 @@ class TTS:
                 prompt_text += "。" if prompt_lang != "en" else "."
             print(i18n("实际输入的参考文本:"), prompt_text)
             if self.prompt_cache["prompt_text"] != prompt_text:
-                phones, bert_features, norm_text = self.text_preprocessor.segment_and_extract_feature_for_text(
+                prompt_result = self.preprocess_adapter.preprocess_segment_text(
                     prompt_text, prompt_lang, self.configs.version
                 )
                 self.prompt_cache["prompt_text"] = prompt_text
                 self.prompt_cache["prompt_lang"] = prompt_lang
-                self.prompt_cache["phones"] = phones
-                self.prompt_cache["bert_features"] = bert_features
-                self.prompt_cache["norm_text"] = norm_text
+                self.prompt_cache["phones"] = prompt_result["phones"]
+                self.prompt_cache["bert_features"] = prompt_result["bert_features"]
+                self.prompt_cache["norm_text"] = prompt_result["norm_text"]
 
         ###### text preprocessing ########
         t1 = time.perf_counter()
         data: list = None
         if not (return_fragment or streaming_mode):
-            data = self.text_preprocessor.preprocess(text, text_lang, text_split_method, self.configs.version)
+            preprocess_result = self.preprocess_adapter.preprocess_text(
+                text, text_lang, text_split_method, self.configs.version
+            )
+            data = preprocess_result["segments"]
             if len(data) == 0:
                 yield 16000, np.zeros(int(16000), dtype=np.int16)
                 return
@@ -1183,10 +1209,10 @@ class TTS:
                 split_bucket=split_bucket,
                 device=self.configs.device,
                 precision=self.precision,
-            )
+                )
         else:
             print(f"############ {i18n('切分文本')} ############")
-            texts = self.text_preprocessor.pre_seg_text(text, text_lang, text_split_method)
+            texts = self.preprocess_adapter.pre_segment_text(text, text_lang, text_split_method)["segments"]
             data = []
             for i in range(len(texts)):
                 if i % batch_size == 0:
@@ -1197,15 +1223,15 @@ class TTS:
                 batch_data = []
                 print(f"############ {i18n('提取文本Bert特征')} ############")
                 for text in tqdm(batch_texts):
-                    phones, bert_features, norm_text = self.text_preprocessor.segment_and_extract_feature_for_text(
+                    segment_result = self.preprocess_adapter.preprocess_segment_text(
                         text, text_lang, self.configs.version
                     )
-                    if phones is None:
+                    if segment_result["phones"] is None:
                         continue
                     res = {
-                        "phones": phones,
-                        "bert_features": bert_features,
-                        "norm_text": norm_text,
+                        "phones": segment_result["phones"],
+                        "bert_features": segment_result["bert_features"],
+                        "norm_text": segment_result["norm_text"],
                     }
                     batch_data.append(res)
                 if len(batch_data) == 0:
@@ -1572,13 +1598,22 @@ class TTS:
         if super_sampling:
             print(f"############ {i18n('音频超采样')} ############")
             t1 = time.perf_counter()
-            self.init_sr_model()
-            if not self.sr_model_not_exist:
-                audio, sr = self.sr_model(audio.unsqueeze(0), sr)
-                max_audio = np.abs(audio).max()
-                if max_audio > 1:
-                    audio /= max_audio
-            audio = (audio * 32768).astype(np.int16)
+            try:
+                audio, sr = self.postprocess_adapter.super_resolve(audio.unsqueeze(0), sr)
+                if isinstance(audio, torch.Tensor):
+                    max_audio = torch.abs(audio).max()
+                    if max_audio > 1:
+                        audio = audio / max_audio
+                    audio = audio.squeeze(0).cpu().numpy()
+                else:
+                    max_audio = np.abs(audio).max()
+                    if max_audio > 1:
+                        audio /= max_audio
+            except FileNotFoundError:
+                self.sr_model_not_exist = True
+                print(i18n("你没有下载超分模型的参数，因此不进行超分。如想超分请先参照教程把文件下载好"))
+                if isinstance(audio, torch.Tensor):
+                    audio = audio.cpu().numpy()
             t2 = time.perf_counter()
             print(f"超采样用时：{t2 - t1:.3f}s")
         else:
@@ -1657,10 +1692,7 @@ class TTS:
         cfm_res = torch.cat(cfm_resss, 2)
         cfm_res = denorm_spec(cfm_res)
 
-        with torch.inference_mode():
-            wav_gen = self.vocoder(cfm_res)
-            audio = wav_gen[0][0]  # .cpu().detach().numpy()
-
+        audio, _ = self.postprocess_adapter.synthesize_vocoder(cfm_res, self.configs.version)
         return audio
 
     def using_vocoder_synthesis_batched_infer(
@@ -1754,9 +1786,7 @@ class TTS:
 
         pred_spec = denorm_spec(pred_spec)
 
-        with torch.no_grad():
-            wav_gen = self.vocoder(pred_spec)
-            audio = wav_gen[0][0]  # .cpu().detach().numpy()
+        audio, _ = self.postprocess_adapter.synthesize_vocoder(pred_spec, self.configs.version)
 
         audio_fragments = []
         upsample_rate = self.vocoder_configs["upsample_rate"]
